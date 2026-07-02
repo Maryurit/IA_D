@@ -561,174 +561,183 @@ def dibujar_ui(frame, placa_confirmada, nombre_camara="", mensaje_extra=""):
 # ======================================================================
 
 def procesar_camara(camara):
+    """
+    Procesador de cámara con reconexión automática infinita.
+    Si la cámara se desconecta, espera y vuelve a intentar indefinidamente.
+    """
     cam_id   = camara["id"]
     nombre   = camara.get("nombre", f"Camara-{cam_id}")
     rtsp_url = camara["urlStream"]
 
-    # ---- Conexión con reintentos ----
-    cap = None
-    for intento in range(3):
-        cap = cv2.VideoCapture(rtsp_url)
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if cap.isOpened():
-            logger.info(f"✅ Conectado: {nombre}")
-            break
-        cap.release()
-        logger.warning(f"⚠️  Intento {intento+1}/3 fallido para {nombre}")
-        time.sleep(2)
-    else:
-        logger.error(f"🚫 No se pudo conectar a {nombre}")
-        return
-
-    # ---- Estado local por cámara ----
-    ultima_placa       = None
-    historial_lecturas = []
-    tracker            = CentroidTracker()
-    cooldowns_alerta   = {}          # tipo_alerta → timestamp última alerta
-
-    frame_count     = 0
-    frames_fallidos = 0
-    MAX_FALLIDOS    = 30
-    mensaje_overlay = ""
-
+    # ============================================================
+    # BUCLE INFINITO DE RECONEXIÓN
+    # ============================================================
     while True:
-        ret, frame = cap.read()
+        logger.info(f"🔄 Intentando conectar a {nombre}...")
 
-        # ---- Manejo de frames fallidos / reconexión ----
-        if not ret or frame is None or frame.size == 0:
-            frames_fallidos += 1
-            logger.warning(f"⚠️  Frame fallido {frames_fallidos}/{MAX_FALLIDOS} en {nombre}")
-            if frames_fallidos >= MAX_FALLIDOS:
-                logger.error(f"🔄 Reconectando {nombre}...")
-                cap.release()
-                time.sleep(5)
-                cap = cv2.VideoCapture(rtsp_url)
-                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                if cap.isOpened():
-                    frames_fallidos = 0
-                    logger.info(f"✅ Reconexión exitosa: {nombre}")
-                else:
-                    logger.error(f"🚫 Reconexión fallida. Saliendo de {nombre}")
+        # ---- Intentar abrir la cámara (3 intentos) ----
+        cap = None
+        for intento in range(3):
+            cap = cv2.VideoCapture(rtsp_url)
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if cap.isOpened():
+                logger.info(f"✅ Conectado a: {nombre}")
+                break
+            cap.release()
+            logger.warning(f"⚠️  Intento {intento+1}/3 fallido para {nombre}")
+            time.sleep(2)
+        else:
+            # Si fallaron los 3 intentos, esperar y reintentar desde el inicio
+            logger.error(f"🚫 No se pudo conectar a {nombre}, esperando 30s...")
+            cap = None
+            time.sleep(30)
+            continue  # Vuelve al inicio del while True
+
+        # ============================================================
+        #  ESTADO LOCAL DE LA CÁMARA (se resetea en cada reconexión)
+        # ============================================================
+        ultima_placa       = None
+        historial_lecturas = []
+        tracker            = CentroidTracker()
+        cooldowns_alerta   = {}          # tipo_alerta → timestamp
+        frame_count        = 0
+        mensaje_overlay    = ""
+        frames_fallidos    = 0
+        MAX_FALLIDOS       = 30
+
+        # ============================================================
+        #  BUCLE DE PROCESAMIENTO DE FRAMES
+        # ============================================================
+        while True:
+            ret, frame = cap.read()
+
+            # ---- Manejo de frames fallidos ----
+            if not ret or frame is None or frame.size == 0:
+                frames_fallidos += 1
+                logger.warning(f"⚠️  Frame fallido {frames_fallidos}/{MAX_FALLIDOS} en {nombre}")
+                if frames_fallidos >= MAX_FALLIDOS:
+                    logger.error(f"🔄 Demasiados fallos ({MAX_FALLIDOS}), reconectando {nombre}...")
                     cap.release()
-                    return
-            else:
-                time.sleep(1)
-            continue
+                    time.sleep(5)
+                    break  # Sale del bucle interno → se reinicia desde el while externo
+                else:
+                    time.sleep(1)
+                    continue
 
-        frames_fallidos = 0
-        frame_count    += 1
-        frame = cv2.resize(frame, (640, 360))
+            # Si llegamos aquí, el frame es válido
+            frames_fallidos = 0
+            frame_count += 1
+            frame = cv2.resize(frame, (640, 360))
 
-        # ======== PROCESAMIENTO CADA N FRAMES ========
-        if frame_count % FRAME_SKIP == 0:
-            try:
-                results = model(frame, verbose=False)
+            # ============================================================
+            #  PROCESAMIENTO CADA FRAME_SKIP FRAMES
+            # ============================================================
+            if frame_count % FRAME_SKIP == 0:
+                try:
+                    results = model(frame, verbose=False)
 
-                placa_encontrada = False
-                personas_boxes   = []
+                    placa_encontrada = False
+                    personas_boxes   = []
 
-                for r in results:
-                    for box in r.boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        cls = int(box.cls[0])
+                    for r in results:
+                        for box in r.boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            cls = int(box.cls[0])
 
-                        # -- Vehículo → OCR con 4 variantes (preciso) --
-                        if cls in [2, 7] and not placa_encontrada:
-                            roi  = frame[y1:y2, x1:x2]
-                            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                            # -- Vehículo → OCR con 4 variantes --
+                            if cls in [2, 7] and not placa_encontrada:
+                                roi  = frame[y1:y2, x1:x2]
+                                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-                            placa_ok, historial_lecturas, _ = ocr_buscar_placa(
-                                gray, historial_lecturas, ultima_placa,
-                                variantes_fn=preprocesar_variantes   # 4 variantes
-                            )
+                                placa_ok, historial_lecturas, _ = ocr_buscar_placa(
+                                    gray, historial_lecturas, ultima_placa,
+                                    variantes_fn=preprocesar_variantes
+                                )
 
-                            if placa_ok:
-                                ultima_placa     = placa_ok
-                                placa_encontrada = True
-                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                                logger.info(f"🚗 PLACA CONFIRMADA [{nombre}]: {ultima_placa}")
-                                frame_ui = frame.copy()
-                                dibujar_ui(frame_ui, ultima_placa, nombre)
-                                guardar_imagen(frame_ui, "placa", cam_id)
-                                threading.Thread(
-                                    target=enviar_a_backend,
-                                    args=(ultima_placa, cam_id),
-                                    daemon=True
-                                ).start()
+                                if placa_ok:
+                                    ultima_placa     = placa_ok
+                                    placa_encontrada = True
+                                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                                    logger.info(f"🚗 PLACA CONFIRMADA [{nombre}]: {ultima_placa}")
+                                    frame_ui = frame.copy()
+                                    dibujar_ui(frame_ui, ultima_placa, nombre)
+                                    guardar_imagen(frame_ui, "placa", cam_id)
+                                    threading.Thread(
+                                        target=enviar_a_backend,
+                                        args=(ultima_placa, cam_id),
+                                        daemon=True
+                                    ).start()
 
-                        # -- Persona → acumular para tracker --
-                        elif cls == 0:
-                            personas_boxes.append((x1, y1, x2, y2))
+                            # -- Persona → acumular para tracker --
+                            elif cls == 0:
+                                personas_boxes.append((x1, y1, x2, y2))
 
-                # ---- Tracker + análisis de conducta ----
-                ahora_ts = time.time()
-                tracks_activos = tracker.update(personas_boxes, ahora_ts)
+                    # ---- Tracker + análisis de conducta ----
+                    ahora_ts = time.time()
+                    tracks_activos = tracker.update(personas_boxes, ahora_ts)
 
-                for tid, track in tracks_activos.items():
-                    if track.bboxes:
-                        bx1, by1, bx2, by2 = track.bboxes[-1]
-                        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
-                        cv2.putText(frame, f"P{tid}", (bx1, by1 - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+                    for tid, track in tracks_activos.items():
+                        if track.bboxes:
+                            bx1, by1, bx2, by2 = track.bboxes[-1]
+                            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
+                            cv2.putText(frame, f"P{tid}", (bx1, by1 - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
-                    for tipo_alerta, descripcion in analizar_conducta(track, frame.shape):
-                        ultimo_ts = cooldowns_alerta.get(tipo_alerta, 0)
-                        if ahora_ts - ultimo_ts < COOLDOWN_ALERTA_SEG:
-                            continue
-                        cooldowns_alerta[tipo_alerta] = ahora_ts
-                        mensaje_overlay = tipo_alerta.replace("_", " ")
-                        logger.warning(f"⚠️  [{nombre}] {descripcion}")
-                        frame_alerta = frame.copy()
-                        dibujar_ui(frame_alerta, ultima_placa, nombre, mensaje_overlay)
-                        guardar_imagen(frame_alerta, tipo_alerta.lower(), cam_id)
-                        threading.Thread(
-                            target=enviar_a_backend,
-                            args=(None, cam_id, "SOSPECHOSA", descripcion),
-                            daemon=True
-                        ).start()
+                        for tipo_alerta, descripcion in analizar_conducta(track, frame.shape):
+                            ultimo_ts = cooldowns_alerta.get(tipo_alerta, 0)
+                            if ahora_ts - ultimo_ts < COOLDOWN_ALERTA_SEG:
+                                continue
+                            cooldowns_alerta[tipo_alerta] = ahora_ts
+                            mensaje_overlay = tipo_alerta.replace("_", " ")
+                            logger.warning(f"⚠️  [{nombre}] {descripcion}")
+                            frame_alerta = frame.copy()
+                            dibujar_ui(frame_alerta, ultima_placa, nombre, mensaje_overlay)
+                            guardar_imagen(frame_alerta, tipo_alerta.lower(), cam_id)
+                            threading.Thread(
+                                target=enviar_a_backend,
+                                args=(None, cam_id, "SOSPECHOSA", descripcion),
+                                daemon=True
+                            ).start()
 
-                # ---- Fallback OCR: 1 variante sobre frame completo (rápido) ----
-                if not placa_encontrada:
-                    gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    placa_ok, historial_lecturas, _ = ocr_buscar_placa(
-                        gray_full, historial_lecturas, ultima_placa,
-                        variantes_fn=preprocesar_rapido   # 1 variante → rápido
-                    )
-                    if placa_ok:
-                        ultima_placa = placa_ok
-                        logger.info(f"🚗 PLACA fallback [{nombre}]: {ultima_placa}")
-                        frame_ui = frame.copy()
-                        dibujar_ui(frame_ui, ultima_placa, nombre)
-                        guardar_imagen(frame_ui, "placa", cam_id)
-                        threading.Thread(
-                            target=enviar_a_backend,
-                            args=(ultima_placa, cam_id),
-                            daemon=True
-                        ).start()
+                    # ---- Fallback OCR: 1 variante sobre frame completo ----
+                    if not placa_encontrada:
+                        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        placa_ok, historial_lecturas, _ = ocr_buscar_placa(
+                            gray_full, historial_lecturas, ultima_placa,
+                            variantes_fn=preprocesar_rapido
+                        )
+                        if placa_ok:
+                            ultima_placa = placa_ok
+                            logger.info(f"🚗 PLACA fallback [{nombre}]: {ultima_placa}")
+                            frame_ui = frame.copy()
+                            dibujar_ui(frame_ui, ultima_placa, nombre)
+                            guardar_imagen(frame_ui, "placa", cam_id)
+                            threading.Thread(
+                                target=enviar_a_backend,
+                                args=(ultima_placa, cam_id),
+                                daemon=True
+                            ).start()
 
-            except Exception as e:
-                logger.error(f"❌ Error procesando frame de {nombre}: {e}")
+                except Exception as e:
+                    logger.error(f"❌ Error procesando frame de {nombre}: {e}")
 
-        # ---- UI en pantalla (todos los frames) ----
-        dibujar_ui(frame, ultima_placa, nombre, mensaje_overlay)
-        
-        # ---- Enviar frame al servidor de streaming ----
-        streaming_server.update_camera_frame(cam_id, frame)
-        
-        # NOTA: cv2.imshow() eliminado para producción
-        # El stream se ve en: http://localhost:5001/stream/{cam_id}
-        
-        # Mantener cv2.waitKey() para que OpenCV procese eventos internos
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # ---- UI y streaming ----
+            dibujar_ui(frame, ultima_placa, nombre, mensaje_overlay)
+            streaming_server.update_camera_frame(cam_id, frame)
 
-    cap.release()
-    # cv2.destroyAllWindows() eliminado - no hay ventanas locales
-    streaming_server.remove_camera(cam_id)
+            # ---- Salir del bucle (por si se presiona 'q' en otro proceso) ----
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                cap.release()
+                streaming_server.remove_camera(cam_id)
+                logger.info(f"🛑 Procesamiento detenido por usuario en {nombre}")
+                return
 
-
+        # ---- Si salimos del bucle interno por reconexión, liberar y esperar ----
+        cap.release()
+        logger.info(f"🔄 Reconectando {nombre} en 5 segundos...")
+        time.sleep(5)
+        # El bucle while True externo continúa automáticamente
 # ======================================================================
 # MONITOREO DINÁMICO DE CÁMARAS
 # ======================================================================
@@ -736,6 +745,17 @@ def procesar_camara(camara):
 def monitorear_camaras():
     while True:
         try:
+            # 1. Limpiar threads muertos
+            dead_threads = []
+            for cam_id, thread in active_processors.items():
+                if not thread.is_alive():
+                    dead_threads.append(cam_id)
+                    logger.warning(f"🔄 Thread muerto detectado para cámara {cam_id}, será reiniciado")
+            
+            for cam_id in dead_threads:
+                del active_processors[cam_id]
+
+            # 2. Consultar cámaras activas
             resp = requests.get(
                 f"{config.BACKEND_URL}/api/camaras/activas",
                 headers={"Authorization": f"Bearer {config.SERVICE_TOKEN}"},
@@ -759,7 +779,6 @@ def monitorear_camaras():
         except Exception as e:
             logger.error(f"❌ Error consultando cámaras: {e}")
         time.sleep(25)
-
 
 # ======================================================================
 # ENTRADA PRINCIPAL

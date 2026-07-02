@@ -44,42 +44,27 @@ def remove_camera(cam_id):
 
 @app.route('/stream/<cam_id>')
 def stream_camera(cam_id):
-    """
-    Stream MJPEG de una cámara específica.
-    El frontend puede consumir este endpoint con una etiqueta <img> o <video>.
-    
-    Args:
-        cam_id (str): ID de la cámara a transmitir
-    
-    Returns:
-        Response: Stream MJPEG multipart
-    """
     def generate():
         while True:
             with camera_lock:
                 if cam_id in camera_frames:
                     frame = camera_frames[cam_id]
-                    # Codificar frame a JPEG
                     ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     if ret:
-                        frame_bytes = buffer.tobytes()
                         yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
                 else:
-                    # Frame negro con texto si no hay cámara activa
-                    black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(black_frame, f"CAMARA NO DISPONIBLE: {cam_id}", 
-                               (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    ret, buffer = cv2.imencode('.jpg', black_frame)
-                    if ret:
-                        frame_bytes = buffer.tobytes()
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            
-            # Pequeña pausa para no saturar CPU
-            import time
-            time.sleep(0.033)  # ~30 FPS
-    
+                    # En lugar de un frame negro, detener el stream con un error 404
+                    # Para que el frontend pueda manejar la desconexión
+                    time.sleep(1)
+                    continue
+            time.sleep(0.033)
+
+    # Si no hay frames disponibles, devolver 404 inmediatamente
+    with camera_lock:
+        if cam_id not in camera_frames:
+            return {"error": "Cámara no disponible"}, 404
+
     return Response(generate(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
